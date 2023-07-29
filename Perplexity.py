@@ -150,9 +150,7 @@ class Perplexity:
         self.ws_connected = True
         ws.send("2probe")
 
-    def on_ws_close(self, ws, close_status_code, close_message):
-        logger.warn(f"Websocket closed with status {close_status_code}: {close_message}")
-
+    def on_ws_close(self):
         self.ws_connecting = False
         self.ws_connected = False
         if self.ws_error:
