@@ -6,7 +6,10 @@ from json import loads, dumps
 from random import getrandbits
 from websocket import WebSocketApp
 
-from Answer import Answer, Details
+from perplexity.Answer import Answer, Details
+
+import logging, traceback
+logger = logging.getLogger()
 
 class Perplexity:
     """A class to interact with the Perplexity website.
@@ -14,6 +17,8 @@ class Perplexity:
     For now this class only support one Answer at a time.
     """
     def __init__(self) -> None:
+        self.ws_connecting = False
+        self.ws_connected = False
         self.user_agent: dict = { "User-Agent": "" }
         self.session: Session = self.init_session()
 
@@ -26,9 +31,9 @@ class Perplexity:
         self.frontend_session_id = str(uuid4())
 
         assert self.ask_anonymous_user(), "Failed to ask anonymous user"
-        self.ws: WebSocketApp = self.init_websocket()
+        self.ws = None
+        self.init_websocket()
         self.n = 1
-        self.ws_thread: Thread = Thread(target=self.ws.run_forever).start()
         self.auth_session()
 
         sleep(1)
@@ -40,7 +45,7 @@ class Perplexity:
         session.get(url=f"https://www.perplexity.ai/search/{uuid}", headers=self.user_agent)
 
         return session
-
+    
     def get_t(self) -> str:
         return format(getrandbits(32), "08x")
 
@@ -62,31 +67,36 @@ class Perplexity:
         return response == "OK"
 
     def on_message(self, ws: WebSocketApp, message: str) -> None:
-        if message == "2":
-            ws.send("3")
-        elif message == "3probe":
-            ws.send("5")
+        try:
+            if message == "2":
+                ws.send("3")
+            elif message == "3probe":
+                ws.send("5")
 
-        if (self.searching or self.ask_for_details) and message.startswith(str(430 + self.n)):
-            response = loads(message[3:])[0]
+            if (self.searching or self.ask_for_details) and message.startswith(str(430 + self.n)):
+                response = loads(message[3:])[0]
 
-            if self.searching:
-                self.answer = Answer(
-                    uuid=response["uuid"],
-                    gpt4=response["gpt4"],
-                    text=response["text"],
-                    search_focus=response["search_focus"],
-                    backend_uuid=response["backend_uuid"],
-                    query_str=response["query_str"],
-                    related_queries=response["related_queries"]
-                )
-                self.searching = False
-            else:
-                self.answer.details = Details(
-                    uuid=response["uuid"],
-                    text=response["text"]
-                )
-                self.ask_for_details = False
+                if self.searching:
+                    self.answer = Answer(
+                        uuid=response["uuid"],
+                        gpt4=response["gpt4"],
+                        text=response["text"],
+                        search_focus=response["search_focus"],
+                        backend_uuid=response["backend_uuid"],
+                        query_str=response["query_str"],
+                        related_queries=response["related_queries"]
+                    )
+                    self.searching = False
+                else:
+                    self.answer.details = Details(
+                        uuid=response["uuid"],
+                        text=response["text"]
+                    )
+                    self.ask_for_details = False
+        except:
+            logger.error(traceback.format_exc())
+            self.disconnect_ws()
+            self.connect_ws()
 
     def get_cookies_str(self) -> str:
         cookies = ""
@@ -94,15 +104,65 @@ class Perplexity:
             cookies += f"{key}={value}; "
         return cookies[:-2]
 
-    def init_websocket(self) -> WebSocketApp:
-        return WebSocketApp(
+    def init_websocket(self, timeout=5):
+        if self.ws_connected:
+            return
+        if self.ws_connecting:
+            while not self.ws_connected:
+                sleep(0.01)
+            return
+        self.ws_connecting = True
+        self.ws_connected = False
+        
+        ws = WebSocketApp(
             url=f"wss://www.perplexity.ai/socket.io/?EIO=4&transport=websocket&sid={self.sid}",
             header=self.user_agent,
             cookie=self.get_cookies_str(),
-            on_open=lambda ws: ws.send("2probe"),
+            on_open=lambda ws: self.on_ws_connect(ws),
             on_message=self.on_message,
-            on_error=lambda ws, err: print(f"Error: {err}"),
+            on_error=self.on_ws_error,
+            on_close=self.on_ws_close
         )
+        self.ws = ws
+        ws_thread: Thread = Thread(target=ws.run_forever)
+        ws_thread.daemon = True
+        ws_thread.start()
+
+        timer = 0
+        while not self.ws_connected:
+            sleep(0.01)
+            timer += 0.01
+            if timer > timeout:
+                self.ws_connecting = False
+                self.ws_connected = False
+                self.ws_error = True
+                ws.close()
+                raise RuntimeError("Timed out waiting for websocket to connect.")
+
+    def disconnect_ws(self):
+        self.ws_connecting = False
+        self.ws_connected = False
+        if self.ws:
+            self.ws.close()
+
+    def on_ws_connect(self, ws):
+        self.ws_connecting = False
+        self.ws_connected = True
+        ws.send("2probe")
+
+    def on_ws_close(self, ws, close_status_code, close_message):
+        logger.warn(f"Websocket closed with status {close_status_code}: {close_message}")
+
+        self.ws_connecting = False
+        self.ws_connected = False
+        if self.ws_error:
+            self.ws_error = False
+            self.connect_ws()
+
+    def on_ws_error(self, ws, error):
+        self.ws_connecting = False
+        self.ws_connected = False
+        self.ws_error = True
 
     def auth_session(self) -> None:
         self.session.get(url="https://www.perplexity.ai/api/auth/session", headers=self.user_agent)
@@ -133,6 +193,7 @@ class Perplexity:
         self.ws.send(ws_message)
         while self.searching:
             sleep(0.1)
+        
         return self.answer
 
     def ask_detailed(self) -> Answer:
@@ -152,4 +213,5 @@ class Perplexity:
         self.ws.send(ws_message)
         while self.ask_for_details:
             sleep(0.1)
+        
         return self.answer
